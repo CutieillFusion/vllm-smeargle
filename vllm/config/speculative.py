@@ -63,6 +63,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "smeargle",  # SMEARGLE: Mamba2-based draft, EAGLE3-style I/O contract
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -145,6 +146,11 @@ class SpeculativeConfig:
     provided. Defaults to 1."""
 
     # Alternative drafting strategies
+    speculative_token_tree: str | None = None
+    """Specifies the tree structure for speculative token generation.
+    Used by SMEARGLE (tree mode) and other tree-based proposers. When unset
+    with a chain proposer, defaults to a chain of ``num_speculative_tokens``.
+    """
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
     in parallel rather than sequentially. This can improve performance but
@@ -288,6 +294,7 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "smeargle",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -702,12 +709,15 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "smeargle"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
                 # yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
                 # AngelSlim/Qwen3-8B_eagle3
+                # neurips2026-smeargle/SMEARGLE
+                elif "smeargle" in self.draft_model_config.model.lower():
+                    self.method = "smeargle"
                 elif "eagle-" in self.draft_model_config.model.lower():
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
@@ -739,8 +749,8 @@ class SpeculativeConfig:
                         f"Unsupported speculative method: '{self.method}'"
                     )
 
-                # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                # Replace hf_config for EAGLE/SMEARGLE draft_model (same flow)
+                if self.method in ("eagle", "eagle3", "dflash", "smeargle"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -791,6 +801,18 @@ class SpeculativeConfig:
                     raise ValueError(
                         "A speculative model was provided, but "
                         "`num_speculative_tokens` was not provided"
+                    )
+
+                # Normalize speculative_token_tree (chain default + bfs sort)
+                if self.speculative_token_tree is None:
+                    self.speculative_token_tree = str(
+                        [(i + 1) * (0,) for i in range(self.num_speculative_tokens)]
+                    )
+                else:
+                    import ast as _ast
+                    tree_choices = _ast.literal_eval(self.speculative_token_tree)
+                    self.speculative_token_tree = str(
+                        sorted(tree_choices, key=lambda t: (len(t), t))
                     )
 
                 self.draft_tensor_parallel_size = (
@@ -1076,7 +1098,10 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        # SMEARGLE rides the eagle infrastructure (same draft model flow,
+        # aux-hidden-state input, d2t translation); the proposer is overridden
+        # elsewhere when method=='smeargle'.
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "smeargle")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

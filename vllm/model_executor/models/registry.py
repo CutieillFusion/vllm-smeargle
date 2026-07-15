@@ -608,6 +608,14 @@ _SPECULATIVE_DECODING_MODELS = {
     "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "Eagle3MiniMaxM2ForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "LlamaForCausalLMEagle3": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+    "Mamba2LlamaSmeargleForCausalLM": (
+        "llama_smeargle",
+        "Mamba2LlamaSmeargleForCausalLM",
+    ),
+    "LlamaForCausalLMSmeargle": (
+        "llama_smeargle",
+        "Mamba2LlamaSmeargleForCausalLM",
+    ),
     "Eagle3Qwen2_5vlForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "Eagle3Qwen3vlForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "EagleMistralForCausalLM": ("mistral_eagle", "EagleMistralForCausalLM"),

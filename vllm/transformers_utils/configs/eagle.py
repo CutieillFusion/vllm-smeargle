@@ -72,10 +72,21 @@ class EAGLEConfig(PretrainedConfig):
                 else f"DFlash{arch}"
                 for arch in self.model.architectures
             ]
+        elif method == "smeargle":
+            assert self.model is not None, (
+                "model should not be None when method is smeargle"
+            )
+            # The architecture should already be set by the converter to
+            # "Mamba2LlamaSmeargleForCausalLM" — keep it as-is if so, otherwise
+            # wrap by analogy to Eagle3.
+            kwargs["architectures"] = [
+                arch if "Smeargle" in arch else "Mamba2LlamaSmeargleForCausalLM"
+                for arch in self.model.architectures
+            ]
         else:
             raise ValueError(
                 f"Invalid method {method}. Supported methods are "
-                "eagle, eagle3, and dflash."
+                "eagle, eagle3, dflash, and smeargle."
             )
 
         super().__init__(**kwargs)

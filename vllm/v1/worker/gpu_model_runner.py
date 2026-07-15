@@ -182,6 +182,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.smeargle import SmeargleProposer
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -595,6 +596,18 @@ class GPUModelRunner(
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "smeargle":
+                # use_eagle() returns True for smeargle (rides the eagle infra
+                # for load_model/prepare_inputs/etc.) but we need our own
+                # propose() that knows about Mamba2Cache state, so dispatch
+                # before the generic eagle branch.
+                self.drafter = SmeargleProposer(
+                    self.vllm_config, self.device, self
+                )
+                # SMEARGLE uses the same aux_hidden_state stack as EAGLE3
+                self.use_aux_hidden_state_outputs = (
+                    self.drafter.eagle3_use_aux_hidden_state
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -4511,7 +4524,8 @@ class GPUModelRunner(
                     | DFlashProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
-                    | Gemma4Proposer,
+                    | Gemma4Proposer
+                    | SmeargleProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4987,6 +5001,75 @@ class GPUModelRunner(
             self._copy_valid_sampled_token_count(
                 next_token_ids, valid_sampled_tokens_count
             )
+
+        elif spec_config.method == "smeargle":
+            # Dedicated SMEARGLE branch: bypass all the eagle attention plumbing
+            # and call our standalone proposer directly. SMEARGLE only needs the
+            # per-request aux hidden state stack and the just-verified token id.
+            assert isinstance(self.drafter, SmeargleProposer)
+
+            # Build the (num_tokens, 3*H) or (num_tokens, H) hidden-state tensor.
+            total_num_tokens = common_attn_metadata.num_actual_tokens
+            if self.use_aux_hidden_state_outputs and aux_hidden_states is not None:
+                target_hidden_states_for_smeargle = torch.cat(
+                    [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
+                )
+            else:
+                target_hidden_states_for_smeargle = hidden_states[:total_num_tokens]
+
+            # Extract the "just verified" token per request — for the chain
+            # proposer we use whatever the rejection sampler accepted last.
+            if isinstance(sampled_token_ids, torch.Tensor):
+                # Padded path: (num_reqs, num_spec_tokens+1). The first column
+                # is the position-0 sample (always accepted unless request was
+                # discarded). Use it as a stable "last verified" proxy.
+                last_verified = sampled_token_ids[:, 0].clamp_min(0).long()
+            else:
+                # CPU list path: list[list[int]]
+                num_reqs = len(sampled_token_ids)
+                last_verified = torch.zeros(
+                    num_reqs, dtype=torch.long, device=self.device
+                )
+                for i, toks in enumerate(sampled_token_ids):
+                    if toks:
+                        last_verified[i] = toks[-1]
+
+            # Hand the proposer this step's per-batch request ids so it can
+            # index its per-request stable Mamba2 cache. Batch composition
+            # changes step-to-step, so we cannot rely on batch positions.
+            num_reqs_for_smeargle = common_attn_metadata.num_reqs
+            self.drafter._current_req_ids = list(
+                self.input_batch.req_ids[:num_reqs_for_smeargle]
+            )
+            # FULL_REFRESH / CHAIN_CATCHUP: pass THIS step's sampler output
+            # so the proposer can derive accept_lens of THIS step (not the
+            # PREVIOUS step's, which is what ntns delta would give since
+            # _bookkeeping_sync runs after propose).
+            self.drafter._latest_sampled_token_ids = (
+                sampled_token_ids if isinstance(sampled_token_ids, torch.Tensor)
+                else None
+            )
+            try:
+                draft_token_ids = self.drafter.propose(
+                    target_hidden_states=target_hidden_states_for_smeargle,
+                    next_token_ids=last_verified,
+                    common_attn_metadata=common_attn_metadata,
+                )
+            finally:
+                self.drafter._current_req_ids = None
+                self.drafter._latest_sampled_token_ids = None
+            # Bound memory: if the cache dict grew much larger than the
+            # current batch, evict ids that aren't active right now. This is
+            # safe because spec decode runs on every active request each
+            # step — a missing id means the request finished or is paused
+            # and we can rebuild lazily if it comes back.
+            if (
+                len(self.drafter.stable_caches)
+                > 4 * max(num_reqs_for_smeargle, 1)
+            ):
+                self.drafter.evict_stable_caches(
+                    set(self.input_batch.req_ids[:num_reqs_for_smeargle])
+                )
 
         elif (
             spec_config.use_eagle()
@@ -5964,7 +6047,8 @@ class GPUModelRunner(
                     | DFlashProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
-                    | Gemma4Proposer,
+                    | Gemma4Proposer
+                    | SmeargleProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -6866,7 +6950,11 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DraftModelProposer
+                | Gemma4Proposer
+                | SmeargleProposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6922,7 +7010,8 @@ class GPUModelRunner(
                 EagleProposer
                 | DFlashProposer
                 | ExtractHiddenStatesProposer
-                | Gemma4Proposer,
+                | Gemma4Proposer
+                | SmeargleProposer,
             )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
